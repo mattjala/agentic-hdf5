@@ -1,4 +1,5 @@
 h5py
+hnswlib
 numpy
 pytest
 sentence-transformers

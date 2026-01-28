@@ -11,6 +11,8 @@ from datetime import datetime
 import hashlib
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+import hnswlib
+import pickle
 
 
 BATCH_SIZE = 1000  # Process SMD in batches to bound memory usage
@@ -20,7 +22,8 @@ def vectorize_semantic_metadata(
     filepath: str,
     embedder_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     rebuild: bool = False,
-    object_paths: list[str] | None = None
+    object_paths: list[str] | None = None,
+    use_ann: bool = False
 ) -> dict:
     """
     Convert all text-based semantic metadata into searchable vector embeddings.
@@ -36,6 +39,7 @@ def vectorize_semantic_metadata(
         rebuild: If True, replace existing VSMD; if False, update only new/changed SMD
         object_paths: If provided, only vectorize SMD for these paths;
                      if None, vectorize all SMD in file
+        use_ann: If True, build and store HNSW index for fast approximate nearest neighbor search
 
     Returns:
         Dictionary with:
@@ -109,10 +113,16 @@ def vectorize_semantic_metadata(
         # Concatenate all embeddings
         embeddings_array = np.vstack(all_embeddings).astype(np.float32)
 
-        # Step 5: Compute hash of all SMD content for staleness detection
+        # Step 5: Build ANN index if requested
+        ann_index_data = None
+        if use_ann:
+            print("Building HNSW index...")
+            ann_index_data = _build_hnsw_index(embeddings_array, embed_dim)
+
+        # Step 6: Compute hash of all SMD content for staleness detection
         smd_hash = _compute_smd_hash(all_texts)
 
-        # Step 6: Write VSMD structure to HDF5
+        # Step 7: Write VSMD structure to HDF5
         _write_vsmd_structure(
             filepath,
             all_texts,
@@ -121,7 +131,8 @@ def vectorize_semantic_metadata(
             smd_objects,
             embedder_model,
             embed_dim,
-            smd_hash
+            smd_hash,
+            ann_index_data
         )
 
         return {
@@ -248,6 +259,48 @@ def _compute_smd_hash(texts: list[str]) -> str:
     return hasher.hexdigest()
 
 
+def _build_hnsw_index(embeddings: np.ndarray, embed_dim: int) -> dict:
+    """
+    Build HNSW index for approximate nearest neighbor search.
+
+    Args:
+        embeddings: Array of embeddings (N, embed_dim)
+        embed_dim: Dimension of embeddings
+
+    Returns:
+        Dictionary with serialized index and metadata
+    """
+    num_elements = len(embeddings)
+
+    # HNSW parameters (reasonable defaults for semantic search)
+    M = 16  # Number of bi-directional links per node (higher = better recall, more memory)
+    ef_construction = 200  # Construction time/accuracy tradeoff (higher = better quality, slower build)
+    ef_search = 50  # Query time/accuracy tradeoff (set at query time, this is default)
+
+    # Create index for cosine similarity (since embeddings are L2-normalized)
+    index = hnswlib.Index(space='ip', dim=embed_dim)  # 'ip' = inner product (cosine for normalized)
+
+    # Initialize index
+    index.init_index(max_elements=num_elements, ef_construction=ef_construction, M=M, random_seed=42)
+
+    # Add all vectors to index
+    index.add_items(embeddings, np.arange(num_elements))
+
+    # Set default ef for queries
+    index.set_ef(ef_search)
+
+    # Serialize index to bytes using pickle
+    index_bytes = pickle.dumps(index)
+
+    return {
+        'index_bytes': index_bytes,
+        'M': M,
+        'ef_construction': ef_construction,
+        'ef_search': ef_search,
+        'num_elements': num_elements
+    }
+
+
 def _write_vsmd_structure(
     filepath: str,
     texts: list[str],
@@ -256,7 +309,8 @@ def _write_vsmd_structure(
     smd_objects: list[dict],
     embedder_model: str,
     embed_dim: int,
-    smd_hash: str
+    smd_hash: str,
+    ann_index_data: dict | None = None
 ):
     """
     Write the /ahdf5-vsmd structure to the HDF5 file.
@@ -270,6 +324,7 @@ def _write_vsmd_structure(
         embedder_model: Name of embedding model used
         embed_dim: Dimension of embeddings
         smd_hash: SHA-256 hash of all SMD content
+        ann_index_data: Optional dict with serialized HNSW index and metadata
     """
     with h5py.File(filepath, 'a') as f:
         # Create root VSMD group
@@ -341,3 +396,26 @@ def _write_vsmd_structure(
             compression='gzip',
             compression_opts=4
         )
+
+        # Create /ann_index group if ANN data provided
+        if ann_index_data is not None:
+            ann_group = vsmd_root.create_group('ann_index')
+
+            # Store metadata
+            meta = ann_group.create_group('meta')
+            meta.attrs['index_type'] = 'hnsw'
+            meta.attrs['M'] = ann_index_data['M']
+            meta.attrs['ef_construction'] = ann_index_data['ef_construction']
+            meta.attrs['ef_search'] = ann_index_data['ef_search']
+            meta.attrs['num_elements'] = ann_index_data['num_elements']
+            meta.attrs['version'] = '1.0'
+
+            # Store serialized index as binary dataset
+            index_bytes = np.frombuffer(ann_index_data['index_bytes'], dtype=np.uint8)
+            ann_group.create_dataset(
+                'binary',
+                data=index_bytes,
+                dtype=np.uint8,
+                compression='gzip',
+                compression_opts=4
+            )

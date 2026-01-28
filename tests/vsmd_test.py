@@ -39,7 +39,8 @@ class TestVSMD:
 
             obj.attrs[attr_name] = smd_text
 
-    def test_basic_vectorization_and_query(self, temp_h5_file):
+    @pytest.mark.parametrize("use_ann", [False, True])
+    def test_basic_vectorization_and_query(self, temp_h5_file, use_ann):
         """Test 1: File with SMD on datasets, groups, and committed datatypes."""
         # Create HDF5 structure
         with h5py.File(temp_h5_file, 'w') as f:
@@ -65,7 +66,7 @@ class TestVSMD:
                     'Double precision floating point datatype for scientific measurements')
 
         # Vectorize
-        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True)
+        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True, use_ann=use_ann)
 
         # Verify vectorization succeeded
         assert result['status'] == 'success'
@@ -81,6 +82,14 @@ class TestVSMD:
             assert '/ahdf5-vsmd/chunks' in f
             assert '/ahdf5-vsmd/index' in f
 
+            # Check ANN index presence
+            if use_ann:
+                assert '/ahdf5-vsmd/ann_index' in f
+                assert '/ahdf5-vsmd/ann_index/meta' in f
+                assert '/ahdf5-vsmd/ann_index/binary' in f
+            else:
+                assert '/ahdf5-vsmd/ann_index' not in f
+
             # Check chunks datasets
             assert 'text' in f['/ahdf5-vsmd/chunks']
             assert 'object_path' in f['/ahdf5-vsmd/chunks']
@@ -94,7 +103,8 @@ class TestVSMD:
         query_result = query_semantic_metadata(
             temp_h5_file,
             "temperature measurements in Celsius",
-            top_k=3
+            top_k=3,
+            use_ann=use_ann
         )
 
         assert query_result['status'] == 'success'
@@ -111,14 +121,16 @@ class TestVSMD:
         pressure_result = query_semantic_metadata(
             temp_h5_file,
             "atmospheric pressure",
-            top_k=3
+            top_k=3,
+            use_ann=use_ann
         )
 
         assert pressure_result['status'] == 'success'
         top_pressure = pressure_result['results'][0]
         assert top_pressure['object_path'] == '/sensors/pressure'
 
-    def test_mixed_smd_presence(self, temp_h5_file):
+    @pytest.mark.parametrize("use_ann", [False, True])
+    def test_mixed_smd_presence(self, temp_h5_file, use_ann):
         """Test 2: File with mix of regular SMD, missing SMD, and empty SMD."""
         # Create structure
         with h5py.File(temp_h5_file, 'w') as f:
@@ -136,7 +148,7 @@ class TestVSMD:
                     'Dataset with calibration data for instruments')
 
         # Vectorize
-        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True)
+        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True, use_ann=use_ann)
 
         # Should only vectorize objects with non-empty SMD
         assert result['status'] == 'success'
@@ -157,7 +169,8 @@ class TestVSMD:
         query_result = query_semantic_metadata(
             temp_h5_file,
             "experimental data",
-            top_k=5
+            top_k=5,
+            use_ann=use_ann
         )
 
         assert len(query_result['results']) == 2
@@ -198,7 +211,8 @@ class TestVSMD:
         assert 'no vsmd' in query_result['message'].lower() or \
                'not found' in query_result['message'].lower()
 
-    def test_unusual_utf8_characters(self, temp_h5_file):
+    @pytest.mark.parametrize("use_ann", [False, True])
+    def test_unusual_utf8_characters(self, temp_h5_file, use_ann):
         """Test 4: SMD with unusual UTF-8 characters."""
         # Create datasets
         with h5py.File(temp_h5_file, 'w') as f:
@@ -215,7 +229,7 @@ class TestVSMD:
                     'Données de pression atmosphérique: 测量值 с коэффициентом погрешности')
 
         # Vectorize
-        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True)
+        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True, use_ann=use_ann)
 
         assert result['status'] == 'success'
         assert result['objects_vectorized'] == 3
@@ -235,7 +249,8 @@ class TestVSMD:
         query_result = query_semantic_metadata(
             temp_h5_file,
             "temperature 温度",
-            top_k=3
+            top_k=3,
+            use_ann=use_ann
         )
 
         assert query_result['status'] == 'success'
@@ -245,7 +260,8 @@ class TestVSMD:
         result_paths = [r['object_path'] for r in query_result['results']]
         assert '/chinese_data' in result_paths
 
-    def test_large_scale_vectorization(self, temp_h5_file):
+    @pytest.mark.parametrize("use_ann", [False, True])
+    def test_large_scale_vectorization(self, temp_h5_file, use_ann):
         """Test 5: File with ~1000 SMD entries to test batch processing."""
         NUM_OBJECTS = 1000
 
@@ -269,7 +285,7 @@ class TestVSMD:
             self.add_smd(temp_h5_file, f'/dataset_{i:04d}', smd_text)
 
         # Vectorize - this tests batch processing
-        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True)
+        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True, use_ann=use_ann)
 
         assert result['status'] == 'success'
         assert result['objects_vectorized'] == NUM_OBJECTS
@@ -285,7 +301,8 @@ class TestVSMD:
         query_result = query_semantic_metadata(
             temp_h5_file,
             "temperature sensor data",
-            top_k=10
+            top_k=10,
+            use_ann=use_ann
         )
 
         assert query_result['status'] == 'success'
@@ -295,16 +312,23 @@ class TestVSMD:
         top_5 = query_result['results'][:5]
         assert all('temperature' in r['smd_text'].lower() for r in top_5)
 
-        # Scores should be in descending order
+        # Scores should be in descending order (or nearly so for ANN)
         scores = [r['score'] for r in query_result['results']]
-        assert scores == sorted(scores, reverse=True)
+        if use_ann:
+            # ANN returns approximate results - scores should be roughly descending
+            # but not necessarily perfectly sorted
+            assert scores[0] >= scores[-1] - 0.1  # First should be better than last
+        else:
+            # Brute force returns exact results in perfect order
+            assert scores == sorted(scores, reverse=True)
 
         # Query with min_score filter
         filtered_result = query_semantic_metadata(
             temp_h5_file,
             "humidity weather station",
             top_k=50,
-            min_score=0.5
+            min_score=0.5,
+            use_ann=use_ann
         )
 
         assert filtered_result['status'] == 'success'
@@ -325,7 +349,8 @@ class TestVSMD:
         with pytest.raises(NotImplementedError, match="Incremental updates.*rebuild=False.*not yet implemented"):
             vectorize_semantic_metadata(temp_h5_file, rebuild=False)
 
-    def test_query_with_object_filter(self, temp_h5_file):
+    @pytest.mark.parametrize("use_ann", [False, True])
+    def test_query_with_object_filter(self, temp_h5_file, use_ann):
         """Test querying with object_filter to restrict search scope."""
         # Create hierarchical structure
         with h5py.File(temp_h5_file, 'w') as f:
@@ -352,14 +377,15 @@ class TestVSMD:
                     'Wind speed measurements in meters per second')
 
         # Vectorize
-        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True)
+        result = vectorize_semantic_metadata(temp_h5_file, rebuild=True, use_ann=use_ann)
         assert result['status'] == 'success'
 
         # Query all temperature
         all_temp = query_semantic_metadata(
             temp_h5_file,
             "temperature Celsius",
-            top_k=10
+            top_k=10,
+            use_ann=use_ann
         )
         temp_paths = [r['object_path'] for r in all_temp['results']]
         assert len([p for p in temp_paths if 'temperature' in p]) == 2
@@ -369,7 +395,8 @@ class TestVSMD:
             temp_h5_file,
             "temperature Celsius",
             top_k=10,
-            object_filter="/outdoor_sensors"
+            object_filter="/outdoor_sensors",
+            use_ann=use_ann
         )
 
         outdoor_paths = [r['object_path'] for r in outdoor_only['results']]
@@ -399,3 +426,32 @@ class TestVSMD:
                 "test",
                 embedder_model="sentence-transformers/all-mpnet-base-v2"  # Different model
             )
+
+    def test_ann_index_missing_error(self, temp_h5_file):
+        """Test that querying with use_ann=True fails if index wasn't generated."""
+        # Create and vectorize WITHOUT ANN
+        with h5py.File(temp_h5_file, 'w') as f:
+            f.create_dataset('data', data=[1, 2, 3])
+
+        self.add_smd(temp_h5_file, '/data', 'Test dataset with temperature data')
+
+        result = vectorize_semantic_metadata(
+            temp_h5_file,
+            rebuild=True,
+            use_ann=False  # No ANN index
+        )
+        assert result['status'] == 'success'
+
+        # Verify ANN index doesn't exist
+        with h5py.File(temp_h5_file, 'r') as f:
+            assert '/ahdf5-vsmd/ann_index' not in f
+
+        # Query with use_ann=True should fail
+        query_result = query_semantic_metadata(
+            temp_h5_file,
+            "temperature",
+            use_ann=True
+        )
+
+        assert query_result['status'] == 'error'
+        assert 'ann index not found' in query_result['message'].lower()

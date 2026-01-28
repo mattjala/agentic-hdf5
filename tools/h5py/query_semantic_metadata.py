@@ -8,6 +8,8 @@ vectorized semantic metadata (VSMD).
 import h5py
 import numpy as np
 from sentence_transformers import SentenceTransformer
+import hnswlib
+import pickle
 
 
 BLOCK_SIZE = 128000  # Load embeddings in blocks for large files
@@ -19,7 +21,8 @@ def query_semantic_metadata(
     top_k: int = 5,
     object_filter: str | None = None,
     min_score: float = 0.0,
-    embedder_model: str | None = None
+    embedder_model: str | None = None,
+    use_ann: bool = False
 ) -> dict:
     """
     Perform natural language semantic search over vectorized semantic metadata.
@@ -36,6 +39,7 @@ def query_semantic_metadata(
         object_filter: Optional path prefix to restrict search (e.g., "/data")
         min_score: Minimum similarity score (0.0-1.0)
         embedder_model: Override embedding model (defaults to model used in file)
+        use_ann: If True, use HNSW index for fast approximate search (fails if index not present)
 
     Returns:
         Dictionary with:
@@ -90,7 +94,18 @@ def query_semantic_metadata(
             normalize_embeddings=True  # L2-normalize for cosine similarity
         )[0]  # Extract single vector
 
-        # Step 4: Filter candidates and compute similarity
+        # Step 4: Check if ANN index is available if requested
+        if use_ann:
+            with h5py.File(filepath, 'r') as f:
+                if '/ahdf5-vsmd/ann_index' not in f:
+                    return {
+                        "status": "error",
+                        "message": "ANN index not found. Regenerate VSMD with use_ann=True.",
+                        "query": query_text,
+                        "results": []
+                    }
+
+        # Step 5: Query using ANN or brute force
         with h5py.File(filepath, 'r') as f:
             # Load index to get object metadata
             index = f['/ahdf5-vsmd/index'][:]
@@ -113,37 +128,40 @@ def query_semantic_metadata(
             else:
                 filtered_indices = np.arange(len(index))
 
-            # Step 5: Compute similarity scores
-            # For v1.0, chunk indices = object indices (1 chunk per object)
-            embeddings = f['/ahdf5-vsmd/chunks/embedding']
-
-            # Load relevant embeddings
-            if len(filtered_indices) <= BLOCK_SIZE:
-                # Small enough to load all at once
-                relevant_embeddings = embeddings[filtered_indices]
-            else:
-                # Block-wise loading for large files
-                relevant_embeddings = _load_embeddings_blockwise(
-                    embeddings,
-                    filtered_indices
+            # Step 6: Compute similarity scores using ANN or brute force
+            if use_ann:
+                # Use HNSW index for fast approximate search
+                result_file_indices, similarity_scores = _query_with_hnsw(
+                    f, query_embedding, top_k, filtered_indices, min_score
                 )
+            else:
+                # Brute force search (exact)
+                # For v1.0, chunk indices = object indices (1 chunk per object)
+                embeddings = f['/ahdf5-vsmd/chunks/embedding']
 
-            # Compute dot product (cosine similarity since normalized)
-            similarity_scores = np.dot(relevant_embeddings, query_embedding)
+                # Load relevant embeddings
+                if len(filtered_indices) <= BLOCK_SIZE:
+                    # Small enough to load all at once
+                    relevant_embeddings = embeddings[filtered_indices]
+                else:
+                    # Block-wise loading for large files
+                    relevant_embeddings = _load_embeddings_blockwise(
+                        embeddings,
+                        filtered_indices
+                    )
 
-            # Step 6: Rank and filter
-            # Find indices sorted by score (descending)
-            sorted_indices = np.argsort(similarity_scores)[::-1]
+                # Compute dot product (cosine similarity since normalized)
+                scores = np.dot(relevant_embeddings, query_embedding)
 
-            # Apply min_score filter
-            valid_mask = similarity_scores[sorted_indices] >= min_score
-            sorted_indices = sorted_indices[valid_mask]
+                # Rank and filter
+                sorted_indices = np.argsort(scores)[::-1]
+                valid_mask = scores[sorted_indices] >= min_score
+                sorted_indices = sorted_indices[valid_mask]
+                top_indices = sorted_indices[:top_k]
 
-            # Take top-K
-            top_indices = sorted_indices[:top_k]
-
-            # Map back to original file indices
-            result_file_indices = filtered_indices[top_indices]
+                # Map back to original file indices
+                result_file_indices = filtered_indices[top_indices]
+                similarity_scores = scores[top_indices]
 
             # Step 7: Load corresponding data and format results
             texts = f['/ahdf5-vsmd/chunks/text'][:]
@@ -151,9 +169,8 @@ def query_semantic_metadata(
 
             results = []
             for rank, file_idx in enumerate(result_file_indices, start=1):
-                # Get score (map top_indices back to similarity_scores)
-                score_idx = top_indices[rank - 1]
-                score = float(similarity_scores[score_idx])
+                # Get score for this result
+                score = float(similarity_scores[rank - 1])
 
                 # Get metadata from index
                 obj_metadata = index[file_idx]
@@ -190,6 +207,73 @@ def query_semantic_metadata(
             "query": query_text,
             "results": []
         }
+
+
+def _query_with_hnsw(
+    hdf5_file,
+    query_embedding: np.ndarray,
+    top_k: int,
+    filtered_indices: np.ndarray,
+    min_score: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Query using HNSW index for fast approximate nearest neighbor search.
+
+    Args:
+        hdf5_file: Open HDF5 file handle
+        query_embedding: Query vector (normalized)
+        top_k: Number of results to return
+        filtered_indices: Indices to restrict search (for object_filter)
+        min_score: Minimum similarity score threshold
+
+    Returns:
+        Tuple of (result_indices, similarity_scores)
+    """
+    # Load and deserialize HNSW index
+    index_bytes = hdf5_file['/ahdf5-vsmd/ann_index/binary'][:]
+
+    # Deserialize index using pickle
+    hnsw_index = pickle.loads(index_bytes.tobytes())
+
+    # Get total number of elements in index
+    total_elements = hnsw_index.get_current_count()
+
+    # Handle filtering
+    if len(filtered_indices) < len(hdf5_file['/ahdf5-vsmd/chunks/embedding']):
+        # Object filter is active - need to handle specially
+        # Query more candidates and filter after
+        k_query = min(total_elements, len(filtered_indices), top_k * 10)
+        labels, distances = hnsw_index.knn_query(query_embedding.reshape(1, -1), k=k_query)
+
+        # Filter to only indices in filtered_indices
+        labels = labels[0]
+        distances = distances[0]
+
+        # Create mask for valid indices
+        valid_mask = np.isin(labels, filtered_indices)
+        labels = labels[valid_mask]
+        distances = distances[valid_mask]
+
+        # Take top-K after filtering
+        labels = labels[:top_k]
+        distances = distances[:top_k]
+    else:
+        # No filter - query directly
+        # Clamp k to actual number of elements to avoid hnswlib error
+        k_actual = min(top_k, total_elements)
+        labels, distances = hnsw_index.knn_query(query_embedding.reshape(1, -1), k=k_actual)
+        labels = labels[0]
+        distances = distances[0]
+
+    # Convert distances (inner product) to similarity scores
+    similarity_scores = distances
+
+    # Apply min_score filter
+    valid_mask = similarity_scores >= min_score
+    result_indices = labels[valid_mask]
+    result_scores = similarity_scores[valid_mask]
+
+    return result_indices, result_scores
 
 
 def _starts_with(path, prefix):
